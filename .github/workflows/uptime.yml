@@ -1,19 +1,24 @@
-# GitHub Actions workflow — external uptime probe for registr.kostnidren.cz
+# GitHub Actions workflow — external multi-URL uptime probe.
 #
-# Place at .github/workflows/uptime.yml in a (small, public or private)
-# GitHub repo dedicated to monitoring. The kostnidren codebase lives on
-# Bitbucket; this workflow only needs to exist on a GitHub repo so the cron
-# scheduler runs it — no kostnidren source is mirrored.
+# Probes a curated list of critical URLs every 5 min from GitHub's runners,
+# aggregates results, and alerts Telegram once per run if any URL fails.
+# All-clean → silent.
 #
-# Required secrets in that repo (Settings → Secrets and variables → Actions):
+# Required secrets in this repo (Settings → Secrets and variables → Actions):
 #   TELEGRAM_BOT_TOKEN  — same value as Trellis vault_telegram_bot_token
 #   TELEGRAM_CHAT_ID    — same value as Trellis vault_telegram_chat_id
 #
-# Behaviour:
-#   - Runs every 5 min (GitHub's minimum free-tier cron interval).
-#   - Probes https://registr.kostnidren.cz/ with a 15 s timeout.
-#   - On 2xx/3xx: silent (errors-only).
-#   - On 5xx, timeout, DNS fail, or TLS fail: P0 alert to Telegram.
+# Per-URL classification:
+#   curl error (DNS/TLS/timeout) → "down"   (counts as failure → P0)
+#   HTTP 5xx                     → "5xx"    (counts as failure → P0)
+#   HTTP 2xx/3xx with >10 s      → "slow"   (warning   → P1)
+#   HTTP 2xx/3xx with ≤10 s      → "ok"     (silent)
+#   HTTP 4xx                     → "4xx"    (silent — clients problem, site is up)
+#
+# Run-level severity:
+#   any "down" or "5xx"  → P0
+#   any "slow" only      → P1
+#   only "ok" / "4xx"    → silent
 
 name: Uptime probe — registr.kostnidren.cz
 
@@ -29,65 +34,107 @@ concurrency:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 4
     steps:
-      - name: Probe site
+      - name: Probe URLs
         id: probe
         shell: bash
+        env:
+          BASE_URL: https://registr.kostnidren.cz
+          PATHS: |
+            /
+            /prihlasit-se
+            /chci-pomoct
+            /o-registru/historie/
+            /o-registru/vyrocni-zpravy/
+            /registracni-centra/
+            /wp-json/wp/v2/types
+            /kontakt/
+          SLOW_THRESHOLD_S: "10"
         run: |
           set +e
-          response=$(curl -sS --max-time 15 \
-            -o /tmp/body \
-            -w "code=%{http_code}\nlatency=%{time_total}\nip=%{remote_ip}\n" \
-            "https://registr.kostnidren.cz/")
-          curl_exit=$?
-          echo "$response"
+          declare -a results=()
+          while IFS= read -r path; do
+            [[ -z "${path// }" ]] && continue
+            url="${BASE_URL}${path}"
+            response=$(curl -sS --max-time 15 \
+              -o /dev/null \
+              -w "code=%{http_code} latency=%{time_total}" \
+              -H "User-Agent: kostnidren-uptime-probe/1.0 (+gh-actions)" \
+              "$url")
+            curl_exit=$?
+            code=$(echo "$response" | sed -n 's/.*code=\([0-9]*\).*/\1/p')
+            latency=$(echo "$response" | sed -n 's/.*latency=\([0-9.]*\).*/\1/p')
+            code=${code:-0}
+            latency=${latency:-0}
 
-          code=$(echo "$response" | awk -F= '/^code=/{print $2}')
-          latency=$(echo "$response" | awk -F= '/^latency=/{print $2}')
-          ip=$(echo "$response" | awk -F= '/^ip=/{print $2}')
+            if (( curl_exit != 0 )); then
+              cls="down"
+            elif (( code >= 500 )); then
+              cls="5xx"
+            elif (( code >= 400 )); then
+              cls="4xx"
+            elif (( $(echo "$latency > $SLOW_THRESHOLD_S" | bc -l 2>/dev/null || echo 0) )); then
+              cls="slow"
+            else
+              cls="ok"
+            fi
 
-          {
-            echo "curl_exit=$curl_exit"
-            echo "code=${code:-0}"
-            echo "latency=${latency:-0}"
-            echo "ip=${ip:-unknown}"
-          } >> "$GITHUB_OUTPUT"
+            line="${cls}|${code}|${latency}|${path}|${curl_exit}"
+            echo "  $line"
+            results+=("$line")
+          done <<< "$PATHS"
+
+          # Persist to file for downstream step (handles multi-line cleanly).
+          printf '%s\n' "${results[@]}" > /tmp/results.txt
+          echo "result_file=/tmp/results.txt" >> "$GITHUB_OUTPUT"
 
       - name: Decide whether to alert
         id: decide
         shell: bash
-        env:
-          CURL_EXIT: ${{ steps.probe.outputs.curl_exit }}
-          CODE:      ${{ steps.probe.outputs.code }}
-          LATENCY:   ${{ steps.probe.outputs.latency }}
         run: |
-          # curl_exit 0 means TCP+TLS+HTTP completed (regardless of status).
-          # Non-zero means hard failure — DNS, TLS, timeout, network.
-          if [[ "$CURL_EXIT" != "0" ]]; then
-            echo "alert=yes"           >> "$GITHUB_OUTPUT"
-            echo "title=Web nereaguje (testováno zvenku)"      >> "$GITHUB_OUTPUT"
-            echo "body=Stránka registr.kostnidren.cz neodpovídá z internetu. Buď je server úplně dolů, nebo má problém se sítí / DNS / certifikátem. Zkontroluj VPS panel." >> "$GITHUB_OUTPUT"
-            echo "tech=curl exit $CURL_EXIT (timeout / TLS / DNS) — github actions runner cannot reach origin" >> "$GITHUB_OUTPUT"
-          elif [[ "$CODE" -ge 500 ]]; then
-            echo "alert=yes"           >> "$GITHUB_OUTPUT"
-            echo "title=Web vrací chybu serveru (HTTP $CODE)"  >> "$GITHUB_OUTPUT"
-            echo "body=Stránka registr.kostnidren.cz vrátila chybu místo obsahu. Návštěvníci vidí prázdnou nebo chybovou stránku. Otevři web v prohlížeči — pravděpodobně potřebuje zásah."  >> "$GITHUB_OUTPUT"
-            echo "tech=External probe got HTTP $CODE in ${LATENCY}s from github actions runner" >> "$GITHUB_OUTPUT"
-          elif (( $(echo "$LATENCY > 10" | bc -l 2>/dev/null || echo 0) )); then
-            echo "alert=yes"           >> "$GITHUB_OUTPUT"
-            echo "title=Web odpovídá velmi pomalu" >> "$GITHUB_OUTPUT"
-            echo "body=Stránka registr.kostnidren.cz se načítala přes 10 sekund. Návštěvníci pravděpodobně odejdou. Server je přetížený nebo má problém s databází."  >> "$GITHUB_OUTPUT"
-            echo "tech=External probe latency ${LATENCY}s for HTTP $CODE" >> "$GITHUB_OUTPUT"
+          down=0; xx5=0; slow=0; ok=0; xx4=0
+          down_list=""; xx5_list=""; slow_list=""
+          while IFS='|' read -r cls code latency path curl_exit; do
+            [[ -z "$cls" ]] && continue
+            case "$cls" in
+              down) down=$((down+1)); down_list+="• ${path} (síťová chyba)\n" ;;
+              5xx)  xx5=$((xx5+1));   xx5_list+="• ${path} (HTTP ${code})\n" ;;
+              slow) slow=$((slow+1)); slow_list+="• ${path} (${latency}s)\n" ;;
+              4xx)  xx4=$((xx4+1)) ;;
+              ok)   ok=$((ok+1)) ;;
+            esac
+          done < /tmp/results.txt
+
+          total=$((down + xx5 + slow + ok + xx4))
+          fails=$((down + xx5))
+          warns=$slow
+
+          if (( fails > 0 )); then
+            severity=P0
+            title="Web nedostupný na některých stránkách (${fails}/${total})"
+            body="Tyto stránky teď nejdou návštěvníkům normálně otevřít:\n${down_list}${xx5_list}\nMá smysl je hned zkontrolovat v prohlížeči."
+          elif (( warns > 0 )); then
+            severity=P1
+            title="Web odpovídá pomalu na některých stránkách (${warns}/${total})"
+            body="Tyto stránky se načítaly přes 10 sekund. Návštěvníci možná odejdou:\n${slow_list}"
           else
-            echo "alert=no"            >> "$GITHUB_OUTPUT"
+            severity=skip
           fi
 
+          {
+            echo "severity=$severity"
+            printf 'title<<EOF\n%s\nEOF\n' "$title"
+            printf 'body<<EOF\n%b\nEOF\n'  "$body"
+            echo "tech=down=$down 5xx=$xx5 4xx=$xx4 slow=$slow ok=$ok total=$total"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Send Telegram alert
-        if: steps.decide.outputs.alert == 'yes'
+        if: steps.decide.outputs.severity != 'skip' && steps.decide.outputs.severity != ''
         env:
           TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEVERITY: ${{ steps.decide.outputs.severity }}
           TITLE:    ${{ steps.decide.outputs.title }}
           BODY:     ${{ steps.decide.outputs.body }}
           TECH:     ${{ steps.decide.outputs.tech }}
@@ -96,9 +143,14 @@ jobs:
           html_escape() {
             printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
           }
+          case "$SEVERITY" in
+            P0) emoji="🔴" ;;
+            P1) emoji="🟡" ;;
+            *)  emoji="⚪" ;;
+          esac
           ts=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-          text=$(printf '%s\n\n%s\n\n%s' \
-            "🔴 <b>$(html_escape "$TITLE")</b>" \
+          text=$(printf '%s %s\n\n%s\n\n%s' \
+            "$emoji" "<b>$(html_escape "$TITLE")</b>" \
             "$(html_escape "$BODY")" \
             "<i>Detail pro vývojáře: $(html_escape "$TECH") · ${ts}</i>")
 

@@ -109,11 +109,40 @@ jobs:
           fi
           echo "missing=${missing%,}" >> "$GITHUB_OUTPUT"
 
+      - name: Probe on-VPS monitor heartbeat
+        id: heartbeat
+        shell: bash
+        env:
+          BASE_URL: https://registr.kostnidren.cz
+          STALE_THRESHOLD_SECONDS: "1800"   # 30 min — VPS cron writes every 5
+        run: |
+          set +e
+          body=$(curl -sS --max-time 10 -A "kostnidren-uptime-probe/1.0" "${BASE_URL}/_monitor.txt")
+          curl_exit=$?
+          if (( curl_exit != 0 )); then
+            echo "watchdog=fetch_failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ts=$(echo "$body" | sed -n 's/^timestamp=//p' | head -1)
+          if [[ -z "$ts" || ! "$ts" =~ ^[0-9]+$ ]]; then
+            echo "watchdog=parse_failed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          now=$(date +%s)
+          age=$((now - ts))
+          echo "Heartbeat age: ${age}s"
+          if (( age > STALE_THRESHOLD_SECONDS )); then
+            echo "watchdog=stale:${age}" >> "$GITHUB_OUTPUT"
+          else
+            echo "watchdog=fresh:${age}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Decide whether to alert
         id: decide
         shell: bash
         env:
           MARKERS_MISSING: ${{ steps.markers.outputs.missing }}
+          WATCHDOG:        ${{ steps.heartbeat.outputs.watchdog }}
         run: |
           down=0; xx5=0; slow=0; ok=0; xx4=0
           down_list=""; xx5_list=""; slow_list=""
@@ -137,6 +166,10 @@ jobs:
           [[ "$MARKERS_MISSING" == *GTM* ]]     && gtm_missing=1
           [[ "$MARKERS_MISSING" == *content* ]] && content_missing=1
 
+          # Watchdog: stale heartbeat = on-VPS monitor is dead.
+          watchdog_stale=0
+          [[ "$WATCHDOG" == stale:* ]] && watchdog_stale=1
+
           if (( fails > 0 )); then
             severity=P0
             title="Web nedostupný na některých stránkách (${fails}/${total})"
@@ -145,6 +178,10 @@ jobs:
             severity=P0
             title="Domovská stránka má rozbitý obsah"
             body="Web vrátil HTTP 200, ale obsah neobsahuje očekávanou identifikaci stránky. Šablona se zřejmě sype — návštěvníci možná vidí prázdnou nebo polámanou stránku. Otevři web v prohlížeči."
+          elif (( watchdog_stale == 1 )); then
+            severity=P0
+            title="Monitorovací systém na VPS přestal odesílat signál"
+            body="Server jede, web odpovídá, ale interní monitor nezapsal heartbeat víc než 30 minut. Z toho vyplývá, že nevidíš nic, co se uvnitř děje — log_watcher, app_health a Netdata bridge jsou nejspíš dole. Přihlaš se na VPS a zkontroluj /opt/monitor/ + cron + state.db."
           elif (( gtm_missing == 1 )); then
             severity=P1
             title="Analytika je rozbitá — GTM neběží"
@@ -161,7 +198,7 @@ jobs:
             echo "severity=$severity"
             printf 'title<<EOF\n%s\nEOF\n' "$title"
             printf 'body<<EOF\n%b\nEOF\n'  "$body"
-            echo "tech=down=$down 5xx=$xx5 4xx=$xx4 slow=$slow ok=$ok total=$total markers_missing=${MARKERS_MISSING:-none}"
+            echo "tech=down=$down 5xx=$xx5 4xx=$xx4 slow=$slow ok=$ok total=$total markers_missing=${MARKERS_MISSING:-none} watchdog=${WATCHDOG:-unknown}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Send Telegram alert

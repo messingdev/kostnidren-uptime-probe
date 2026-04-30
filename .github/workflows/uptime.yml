@@ -96,15 +96,16 @@ jobs:
           html_escape() {
             printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
           }
-          text="🔴 <b>$(html_escape "$TITLE")</b>
+          ts=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          text=$(printf '%s\n\n%s\n\n%s' \
+            "🔴 <b>$(html_escape "$TITLE")</b>" \
+            "$(html_escape "$BODY")" \
+            "<i>Detail pro vývojáře: $(html_escape "$TECH") · ${ts}</i>")
 
-$(html_escape "$BODY")
-
-<i>Detail pro vývojáře: $(html_escape "$TECH") · $(date -u '+%Y-%m-%d %H:%M:%S UTC')</i>"
-
-          curl -sS --max-time 10 \
+          response=$(curl -sS --max-time 10 \
             -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT}" \
             --data-urlencode "parse_mode=HTML" \
-            --data-urlencode "text=${text}" | tee /tmp/tg
-          grep -q '"ok":true' /tmp/tg
+            --data-urlencode "text=${text}")
+          echo "$response"
+          echo "$response" | grep -q '"ok":true'

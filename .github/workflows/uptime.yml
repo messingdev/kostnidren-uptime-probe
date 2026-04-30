@@ -1,0 +1,110 @@
+# GitHub Actions workflow — external uptime probe for registr.kostnidren.cz
+#
+# Place at .github/workflows/uptime.yml in a (small, public or private)
+# GitHub repo dedicated to monitoring. The kostnidren codebase lives on
+# Bitbucket; this workflow only needs to exist on a GitHub repo so the cron
+# scheduler runs it — no kostnidren source is mirrored.
+#
+# Required secrets in that repo (Settings → Secrets and variables → Actions):
+#   TELEGRAM_BOT_TOKEN  — same value as Trellis vault_telegram_bot_token
+#   TELEGRAM_CHAT_ID    — same value as Trellis vault_telegram_chat_id
+#
+# Behaviour:
+#   - Runs every 5 min (GitHub's minimum free-tier cron interval).
+#   - Probes https://registr.kostnidren.cz/ with a 15 s timeout.
+#   - On 2xx/3xx: silent (errors-only).
+#   - On 5xx, timeout, DNS fail, or TLS fail: P0 alert to Telegram.
+
+name: Uptime probe — registr.kostnidren.cz
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: uptime-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Probe site
+        id: probe
+        shell: bash
+        run: |
+          set +e
+          response=$(curl -sS --max-time 15 \
+            -o /tmp/body \
+            -w "code=%{http_code}\nlatency=%{time_total}\nip=%{remote_ip}\n" \
+            "https://registr.kostnidren.cz/")
+          curl_exit=$?
+          echo "$response"
+
+          code=$(echo "$response" | awk -F= '/^code=/{print $2}')
+          latency=$(echo "$response" | awk -F= '/^latency=/{print $2}')
+          ip=$(echo "$response" | awk -F= '/^ip=/{print $2}')
+
+          {
+            echo "curl_exit=$curl_exit"
+            echo "code=${code:-0}"
+            echo "latency=${latency:-0}"
+            echo "ip=${ip:-unknown}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to alert
+        id: decide
+        shell: bash
+        env:
+          CURL_EXIT: ${{ steps.probe.outputs.curl_exit }}
+          CODE:      ${{ steps.probe.outputs.code }}
+          LATENCY:   ${{ steps.probe.outputs.latency }}
+        run: |
+          # curl_exit 0 means TCP+TLS+HTTP completed (regardless of status).
+          # Non-zero means hard failure — DNS, TLS, timeout, network.
+          if [[ "$CURL_EXIT" != "0" ]]; then
+            echo "alert=yes"           >> "$GITHUB_OUTPUT"
+            echo "title=Web nereaguje (testováno zvenku)"      >> "$GITHUB_OUTPUT"
+            echo "body=Stránka registr.kostnidren.cz neodpovídá z internetu. Buď je server úplně dolů, nebo má problém se sítí / DNS / certifikátem. Zkontroluj VPS panel." >> "$GITHUB_OUTPUT"
+            echo "tech=curl exit $CURL_EXIT (timeout / TLS / DNS) — github actions runner cannot reach origin" >> "$GITHUB_OUTPUT"
+          elif [[ "$CODE" -ge 500 ]]; then
+            echo "alert=yes"           >> "$GITHUB_OUTPUT"
+            echo "title=Web vrací chybu serveru (HTTP $CODE)"  >> "$GITHUB_OUTPUT"
+            echo "body=Stránka registr.kostnidren.cz vrátila chybu místo obsahu. Návštěvníci vidí prázdnou nebo chybovou stránku. Otevři web v prohlížeči — pravděpodobně potřebuje zásah."  >> "$GITHUB_OUTPUT"
+            echo "tech=External probe got HTTP $CODE in ${LATENCY}s from github actions runner" >> "$GITHUB_OUTPUT"
+          elif (( $(echo "$LATENCY > 10" | bc -l 2>/dev/null || echo 0) )); then
+            echo "alert=yes"           >> "$GITHUB_OUTPUT"
+            echo "title=Web odpovídá velmi pomalu" >> "$GITHUB_OUTPUT"
+            echo "body=Stránka registr.kostnidren.cz se načítala přes 10 sekund. Návštěvníci pravděpodobně odejdou. Server je přetížený nebo má problém s databází."  >> "$GITHUB_OUTPUT"
+            echo "tech=External probe latency ${LATENCY}s for HTTP $CODE" >> "$GITHUB_OUTPUT"
+          else
+            echo "alert=no"            >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send Telegram alert
+        if: steps.decide.outputs.alert == 'yes'
+        env:
+          TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          TITLE:    ${{ steps.decide.outputs.title }}
+          BODY:     ${{ steps.decide.outputs.body }}
+          TECH:     ${{ steps.decide.outputs.tech }}
+        shell: bash
+        run: |
+          html_escape() {
+            printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+          }
+          text="🔴 <b>$(html_escape "$TITLE")</b>
+
+$(html_escape "$BODY")
+
+<i>Detail pro vývojáře: $(html_escape "$TECH") · $(date -u '+%Y-%m-%d %H:%M:%S UTC')</i>"
+
+          curl -sS --max-time 10 \
+            -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT}" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "text=${text}" | tee /tmp/tg
+          grep -q '"ok":true' /tmp/tg

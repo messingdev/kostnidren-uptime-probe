@@ -11,7 +11,7 @@
 #
 # Behaviour:
 #   - Runs every 5 min (GitHub's minimum free-tier cron interval).
-#   - Probes https://registr.kostnidren.cz/ with a 15 s timeout.
+#   - Probes https://registr.kostnidren.cz/__test_404_should_alert__ with a 15 s timeout.
 #   - On 2xx/3xx: silent (errors-only).
 #   - On 5xx, timeout, DNS fail, or TLS fail: P0 alert to Telegram.
 
@@ -39,7 +39,7 @@ jobs:
           response=$(curl -sS --max-time 15 \
             -o /tmp/body \
             -w "code=%{http_code}\nlatency=%{time_total}\nip=%{remote_ip}\n" \
-            "https://registr.kostnidren.cz/")
+            "https://registr.kostnidren.cz/__test_404_should_alert__")
           curl_exit=$?
           echo "$response"
 

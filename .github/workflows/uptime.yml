@@ -89,9 +89,31 @@ jobs:
           printf '%s\n' "${results[@]}" > /tmp/results.txt
           echo "result_file=/tmp/results.txt" >> "$GITHUB_OUTPUT"
 
+      - name: Probe homepage content markers (GTM + page-defining string)
+        id: markers
+        shell: bash
+        env:
+          BASE_URL: https://registr.kostnidren.cz
+          GTM_MARKER: GTM-MTJHH4VX
+          CONTENT_MARKER: kostnidren
+        run: |
+          set +e
+          body=$(curl -sS --max-time 15 -A "kostnidren-uptime-probe/1.0" "${BASE_URL}/")
+          curl_exit=$?
+          missing=""
+          if (( curl_exit != 0 )); then
+            echo "curl failed exit=$curl_exit — skipping marker check"
+          else
+            grep -q "$GTM_MARKER" <<<"$body"     || missing+="GTM,"
+            grep -qi "$CONTENT_MARKER" <<<"$body" || missing+="content,"
+          fi
+          echo "missing=${missing%,}" >> "$GITHUB_OUTPUT"
+
       - name: Decide whether to alert
         id: decide
         shell: bash
+        env:
+          MARKERS_MISSING: ${{ steps.markers.outputs.missing }}
         run: |
           down=0; xx5=0; slow=0; ok=0; xx4=0
           down_list=""; xx5_list=""; slow_list=""
@@ -110,10 +132,23 @@ jobs:
           fails=$((down + xx5))
           warns=$slow
 
+          # Marker findings (only meaningful when homepage itself returned 2xx).
+          gtm_missing=0; content_missing=0
+          [[ "$MARKERS_MISSING" == *GTM* ]]     && gtm_missing=1
+          [[ "$MARKERS_MISSING" == *content* ]] && content_missing=1
+
           if (( fails > 0 )); then
             severity=P0
             title="Web nedostupný na některých stránkách (${fails}/${total})"
             body="Tyto stránky teď nejdou návštěvníkům normálně otevřít:\n${down_list}${xx5_list}\nMá smysl je hned zkontrolovat v prohlížeči."
+          elif (( content_missing == 1 )); then
+            severity=P0
+            title="Domovská stránka má rozbitý obsah"
+            body="Web vrátil HTTP 200, ale obsah neobsahuje očekávanou identifikaci stránky. Šablona se zřejmě sype — návštěvníci možná vidí prázdnou nebo polámanou stránku. Otevři web v prohlížeči."
+          elif (( gtm_missing == 1 )); then
+            severity=P1
+            title="Analytika je rozbitá — GTM neběží"
+            body="Web jede, ale Google Tag Manager se nenačetl do HTML domovské stránky. Všechny statistiky (návštěvy, konverze, formuláře) teď neslyší. Pravděpodobně poslední deploy odstranil tracking kód."
           elif (( warns > 0 )); then
             severity=P1
             title="Web odpovídá pomalu na některých stránkách (${warns}/${total})"
@@ -126,7 +161,7 @@ jobs:
             echo "severity=$severity"
             printf 'title<<EOF\n%s\nEOF\n' "$title"
             printf 'body<<EOF\n%b\nEOF\n'  "$body"
-            echo "tech=down=$down 5xx=$xx5 4xx=$xx4 slow=$slow ok=$ok total=$total"
+            echo "tech=down=$down 5xx=$xx5 4xx=$xx4 slow=$slow ok=$ok total=$total markers_missing=${MARKERS_MISSING:-none}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Send Telegram alert
